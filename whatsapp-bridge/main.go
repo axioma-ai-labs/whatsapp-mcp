@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,13 +16,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
+	"github.com/skip2/go-qrcode"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -30,6 +32,20 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// AuthState holds the current authentication state for HTTP API access
+type AuthState struct {
+	sync.RWMutex
+	QRCode       string    // Current QR code string (for generating image)
+	QRExpiry     time.Time // When the QR code expires
+	IsConnected  bool      // Whether we're connected to WhatsApp
+	IsLoggedIn   bool      // Whether we have a valid session
+	Phone        string    // Connected phone number
+	Name         string    // Connected account name
+	AuthInProgress bool    // Whether auth flow is in progress
+}
+
+var authState = &AuthState{}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -774,6 +790,187 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Auth status endpoint - check connection status
+	http.HandleFunc("/api/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authState.RLock()
+		response := map[string]interface{}{
+			"connected":        client.IsConnected(),
+			"logged_in":        client.Store.ID != nil,
+			"auth_in_progress": authState.AuthInProgress,
+		}
+
+		if client.Store.ID != nil {
+			response["phone"] = client.Store.ID.User
+			response["device"] = client.Store.ID.Device
+		}
+		authState.RUnlock()
+
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Auth start endpoint - initiate QR code generation
+	http.HandleFunc("/api/auth/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Check if already logged in
+		if client.Store.ID != nil && client.IsConnected() {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Already logged in",
+				"status":  "connected",
+			})
+			return
+		}
+
+		// Check if auth is already in progress
+		authState.Lock()
+		if authState.AuthInProgress {
+			authState.Unlock()
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "Auth already in progress",
+				"status":  "pending",
+			})
+			return
+		}
+		authState.AuthInProgress = true
+		authState.Unlock()
+
+		// Start QR code generation in background
+		go func() {
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err := client.Connect()
+			if err != nil {
+				authState.Lock()
+				authState.AuthInProgress = false
+				authState.Unlock()
+				fmt.Printf("Failed to connect for QR: %v\n", err)
+				return
+			}
+
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					authState.Lock()
+					authState.QRCode = evt.Code
+					authState.QRExpiry = time.Now().Add(60 * time.Second) // QR codes typically expire in ~60s
+					authState.Unlock()
+
+					// Also print to terminal for debugging
+					fmt.Println("\nQR code available via HTTP API")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					authState.Lock()
+					authState.QRCode = ""
+					authState.AuthInProgress = false
+					authState.IsConnected = true
+					authState.IsLoggedIn = true
+					authState.Unlock()
+					fmt.Println("\nSuccessfully authenticated via QR code!")
+					break
+				} else if evt.Event == "timeout" {
+					authState.Lock()
+					authState.QRCode = ""
+					authState.AuthInProgress = false
+					authState.Unlock()
+					fmt.Println("\nQR code scan timeout")
+					break
+				}
+			}
+		}()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "QR code generation started",
+			"status":  "pending",
+		})
+	})
+
+	// Auth QR endpoint - get current QR code as base64 PNG
+	http.HandleFunc("/api/auth/qr", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authState.RLock()
+		qrCode := authState.QRCode
+		expiry := authState.QRExpiry
+		inProgress := authState.AuthInProgress
+		authState.RUnlock()
+
+		if qrCode == "" {
+			status := "no_qr"
+			if !inProgress {
+				status = "not_started"
+			}
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "No QR code available",
+				"status":  status,
+			})
+			return
+		}
+
+		// Generate QR code as PNG
+		png, err := qrcode.Encode(qrCode, qrcode.Medium, 256)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to generate QR image: %v", err),
+			})
+			return
+		}
+
+		// Encode as base64
+		base64PNG := base64.StdEncoding.EncodeToString(png)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"qr":         base64PNG,
+			"qr_raw":     qrCode, // Raw string for terminal display if needed
+			"expires_at": expiry.Unix(),
+		})
+	})
+
+	// Auth logout endpoint - disconnect and clear session
+	http.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected",
+			})
+			return
+		}
+
+		// Disconnect the client
+		client.Disconnect()
+
+		// Clear auth state
+		authState.Lock()
+		authState.IsConnected = false
+		authState.QRCode = ""
+		authState.AuthInProgress = false
+		authState.Unlock()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Logged out successfully",
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -790,6 +987,16 @@ func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+
+	// Get configuration from environment
+	httpPort := 8080
+	if portStr := os.Getenv("HTTP_PORT"); portStr != "" {
+		if p, err := fmt.Sscanf(portStr, "%d", &httpPort); p != 1 || err != nil {
+			logger.Warnf("Invalid HTTP_PORT, using default 8080")
+			httpPort = 8080
+		}
+	}
+	qrMode := os.Getenv("QR_MODE") // "http" for HTTP-based QR, anything else for terminal
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -847,43 +1054,73 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			authState.Lock()
+			authState.IsConnected = true
+			authState.Unlock()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			authState.Lock()
+			authState.IsConnected = false
+			authState.IsLoggedIn = false
+			authState.Unlock()
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
+	// Start REST API server early if in HTTP QR mode (so it's available for auth)
+	if qrMode == "http" {
+		startRESTServer(client, messageStore, httpPort)
+		fmt.Printf("REST API server started on port %d\n", httpPort)
+	}
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		if qrMode == "http" {
+			// HTTP mode: Don't block, wait for auth via /api/auth/start
+			fmt.Println("\n⏳ No WhatsApp session found.")
+			fmt.Println("   Use POST /api/auth/start to initiate QR code authentication.")
+			fmt.Println("   Then GET /api/auth/qr to retrieve the QR code.")
+			fmt.Println("   Poll GET /api/auth/status to check connection status.")
+		} else {
+			// Terminal mode: Show QR in terminal and block
+			connected := make(chan bool, 1)
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
 			}
-		}
 
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
+			// Print QR code for pairing with phone
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
+			}
+
+			// Wait for connection
+			select {
+			case <-connected:
+				fmt.Println("\nSuccessfully connected and authenticated!")
+			case <-time.After(3 * time.Minute):
+				logger.Errorf("Timeout waiting for QR code scan")
+				return
+			}
+
+			// Wait a moment for connection to stabilize
+			time.Sleep(2 * time.Second)
+
+			if !client.IsConnected() {
+				logger.Errorf("Failed to establish stable connection")
+				return
+			}
+
+			fmt.Println("\n✓ Connected to WhatsApp!")
 		}
 	} else {
 		// Already logged in, just connect
@@ -892,27 +1129,31 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		connected <- true
+
+		// Wait a moment for connection to stabilize
+		time.Sleep(2 * time.Second)
+
+		if client.IsConnected() {
+			authState.Lock()
+			authState.IsConnected = true
+			authState.IsLoggedIn = true
+			authState.Unlock()
+			fmt.Println("\n✓ Connected to WhatsApp!")
+		} else {
+			logger.Warnf("Connection established but not stable")
+		}
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+	// Start REST API server if not already started
+	if qrMode != "http" {
+		startRESTServer(client, messageStore, httpPort)
 	}
-
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	fmt.Printf("REST server is running on port %d. Press Ctrl+C to disconnect and exit.\n", httpPort)
 
 	// Wait for termination signal
 	<-exitChan
