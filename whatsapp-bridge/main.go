@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -935,6 +936,283 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"qr":         base64PNG,
 			"qr_raw":     qrCode, // Raw string for terminal display if needed
 			"expires_at": expiry.Unix(),
+		})
+	})
+
+	// ==========================================
+	// CHAT & MESSAGE ENDPOINTS
+	// ==========================================
+
+	// List all chats endpoint
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get limit from query params (default 50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			if l, err := fmt.Sscanf(limitStr, "%d", &limit); l != 1 || err != nil {
+				limit = 50
+			}
+		}
+
+		// Get chats from database
+		chatTimes, err := messageStore.GetChats()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get chats: %v", err),
+			})
+			return
+		}
+
+		// Get chat names from database
+		rows, err := messageStore.db.Query("SELECT jid, name, last_message_time FROM chats ORDER BY last_message_time DESC LIMIT ?", limit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to query chats: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		type ChatResponse struct {
+			JID             string `json:"jid"`
+			Name            string `json:"name"`
+			LastMessageTime string `json:"last_message_time"`
+			IsGroup         bool   `json:"is_group"`
+		}
+
+		var chats []ChatResponse
+		for rows.Next() {
+			var jid, name string
+			var lastMessageTime time.Time
+			if err := rows.Scan(&jid, &name, &lastMessageTime); err != nil {
+				continue
+			}
+			chats = append(chats, ChatResponse{
+				JID:             jid,
+				Name:            name,
+				LastMessageTime: lastMessageTime.Format(time.RFC3339),
+				IsGroup:         strings.Contains(jid, "@g.us"),
+			})
+		}
+
+		// Handle empty chats
+		if chats == nil {
+			chats = []ChatResponse{}
+		}
+
+		_ = chatTimes // Unused but keeping for potential future use
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"chats":   chats,
+		})
+	})
+
+	// Get messages from a chat endpoint
+	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get chat_jid from query params (required)
+		chatJID := r.URL.Query().Get("chat_jid")
+		if chatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "chat_jid parameter is required",
+			})
+			return
+		}
+
+		// Get limit from query params (default 50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			if l, err := fmt.Sscanf(limitStr, "%d", &limit); l != 1 || err != nil {
+				limit = 50
+			}
+		}
+
+		// Get messages from database
+		rows, err := messageStore.db.Query(
+			`SELECT id, sender, content, timestamp, is_from_me, media_type, filename
+			 FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?`,
+			chatJID, limit,
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get messages: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		type MessageResponse struct {
+			ID        string `json:"id"`
+			Sender    string `json:"sender"`
+			Content   string `json:"content"`
+			Timestamp string `json:"timestamp"`
+			IsFromMe  bool   `json:"is_from_me"`
+			MediaType string `json:"media_type,omitempty"`
+			Filename  string `json:"filename,omitempty"`
+		}
+
+		var messages []MessageResponse
+		for rows.Next() {
+			var id, sender, content string
+			var timestamp time.Time
+			var isFromMe bool
+			var mediaType, filename sql.NullString
+
+			if err := rows.Scan(&id, &sender, &content, &timestamp, &isFromMe, &mediaType, &filename); err != nil {
+				continue
+			}
+			messages = append(messages, MessageResponse{
+				ID:        id,
+				Sender:    sender,
+				Content:   content,
+				Timestamp: timestamp.Format(time.RFC3339),
+				IsFromMe:  isFromMe,
+				MediaType: mediaType.String,
+				Filename:  filename.String,
+			})
+		}
+
+		// Handle empty messages
+		if messages == nil {
+			messages = []MessageResponse{}
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"messages": messages,
+		})
+	})
+
+	// Search contacts endpoint
+	http.HandleFunc("/api/contacts/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get search query from params
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "q parameter is required",
+			})
+			return
+		}
+
+		// Search in chats table (contacts are stored as chats)
+		rows, err := messageStore.db.Query(
+			`SELECT jid, name FROM chats
+			 WHERE name LIKE ? OR jid LIKE ?
+			 ORDER BY last_message_time DESC LIMIT 50`,
+			"%"+query+"%", "%"+query+"%",
+		)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to search contacts: %v", err),
+			})
+			return
+		}
+		defer rows.Close()
+
+		type ContactResponse struct {
+			JID     string `json:"jid"`
+			Name    string `json:"name"`
+			IsGroup bool   `json:"is_group"`
+		}
+
+		var contacts []ContactResponse
+		for rows.Next() {
+			var jid, name string
+			if err := rows.Scan(&jid, &name); err != nil {
+				continue
+			}
+			contacts = append(contacts, ContactResponse{
+				JID:     jid,
+				Name:    name,
+				IsGroup: strings.Contains(jid, "@g.us"),
+			})
+		}
+
+		// Handle empty contacts
+		if contacts == nil {
+			contacts = []ContactResponse{}
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  true,
+			"contacts": contacts,
+		})
+	})
+
+	// Get single chat metadata endpoint
+	http.HandleFunc("/api/chats/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Extract chat JID from path
+		chatJID := strings.TrimPrefix(r.URL.Path, "/api/chats/")
+		if chatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "chat JID is required",
+			})
+			return
+		}
+
+		// URL decode the JID
+		chatJID, _ = url.QueryUnescape(chatJID)
+
+		// Get chat from database
+		var name string
+		var lastMessageTime time.Time
+		err := messageStore.db.QueryRow(
+			"SELECT name, last_message_time FROM chats WHERE jid = ?",
+			chatJID,
+		).Scan(&name, &lastMessageTime)
+
+		if err == sql.ErrNoRows {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Chat not found",
+			})
+			return
+		} else if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get chat: %v", err),
+			})
+			return
+		}
+
+		// Count messages in chat
+		var messageCount int
+		messageStore.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&messageCount)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"chat": map[string]interface{}{
+				"jid":               chatJID,
+				"name":              name,
+				"last_message_time": lastMessageTime.Format(time.RFC3339),
+				"is_group":          strings.Contains(chatJID, "@g.us"),
+				"message_count":     messageCount,
+			},
 		})
 	})
 
