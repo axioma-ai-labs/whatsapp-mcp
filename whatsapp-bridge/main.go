@@ -44,6 +44,12 @@ type AuthState struct {
 	Phone        string    // Connected phone number
 	Name         string    // Connected account name
 	AuthInProgress bool    // Whether auth flow is in progress
+	// History sync status
+	HistorySyncInProgress bool      // Whether history sync is happening
+	HistorySyncStarted    time.Time // When sync started
+	HistorySyncConversations int    // Total conversations being synced
+	HistorySyncMessages   int       // Messages synced so far
+	HistorySyncComplete   bool      // Whether sync completed
 }
 
 var authState = &AuthState{}
@@ -806,6 +812,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			response["phone"] = client.Store.ID.User
 			response["device"] = client.Store.ID.Device
 		}
+
+		// Include history sync status
+		response["history_sync"] = map[string]interface{}{
+			"in_progress":   authState.HistorySyncInProgress,
+			"complete":      authState.HistorySyncComplete,
+			"conversations": authState.HistorySyncConversations,
+			"messages":      authState.HistorySyncMessages,
+		}
 		authState.RUnlock()
 
 		json.NewEncoder(w).Encode(response)
@@ -1216,6 +1230,64 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// History sync status endpoint
+	http.HandleFunc("/api/history/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authState.RLock()
+		response := map[string]interface{}{
+			"in_progress":   authState.HistorySyncInProgress,
+			"complete":      authState.HistorySyncComplete,
+			"conversations": authState.HistorySyncConversations,
+			"messages":      authState.HistorySyncMessages,
+		}
+		if !authState.HistorySyncStarted.IsZero() {
+			response["started_at"] = authState.HistorySyncStarted.Format(time.RFC3339)
+			response["duration_seconds"] = int(time.Since(authState.HistorySyncStarted).Seconds())
+		}
+		authState.RUnlock()
+
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// Trigger history sync endpoint
+	http.HandleFunc("/api/history/sync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Reset sync status
+		authState.Lock()
+		authState.HistorySyncInProgress = true
+		authState.HistorySyncStarted = time.Now()
+		authState.HistorySyncConversations = 0
+		authState.HistorySyncMessages = 0
+		authState.HistorySyncComplete = false
+		authState.Unlock()
+
+		// Trigger history sync in background
+		go func() {
+			requestHistorySync(client)
+		}()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "History sync requested. Check /api/history/status for progress.",
+		})
+	})
+
 	// Auth logout endpoint - disconnect and clear session
 	http.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1526,7 +1598,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	conversationCount := len(historySync.Data.Conversations)
+	fmt.Printf("Received history sync event with %d conversations\n", conversationCount)
+
+	// Update sync status
+	authState.Lock()
+	authState.HistorySyncInProgress = true
+	if authState.HistorySyncStarted.IsZero() {
+		authState.HistorySyncStarted = time.Now()
+	}
+	authState.HistorySyncConversations += conversationCount
+	authState.Unlock()
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1663,7 +1745,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	// Update sync status
+	authState.Lock()
+	authState.HistorySyncMessages += syncedCount
+	// Mark complete if we've processed conversations (sync comes in batches)
+	if conversationCount > 0 {
+		authState.HistorySyncComplete = true
+		authState.HistorySyncInProgress = false
+	}
+	authState.Unlock()
+
+	fmt.Printf("History sync complete. Stored %d messages (total: %d).\n", syncedCount, authState.HistorySyncMessages)
 }
 
 // Request history sync from the server
