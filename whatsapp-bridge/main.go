@@ -678,24 +678,24 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
+// Extract direct path from a WhatsApp media URL.
+//
+// WhatsApp builds the media URL as "https://mmg.whatsapp.net" + directPath + "&mms3=true",
+// and the direct path INCLUDES the signed query string ("?ccb=..&oh=..&oe=..&_nc_sid=..").
+// whatsmeow then requests "https://<host>" + directPath + "&hash=..&mms-type=..", so the
+// query must survive: stripping it produced an unsigned, malformed request that the CDN
+// answered with 403 on every download.
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
+	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...&oe=...&_nc_sid=...&mms3=true
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	directPath := "/" + parts[1]
+	directPath = strings.Replace(directPath, "&mms3=true", "", 1)
+	directPath = strings.Replace(directPath, "?mms3=true", "", 1)
+	return directPath
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -779,6 +779,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			if err != nil {
 				errMsg = err.Error()
 			}
+			fmt.Printf("Media download failed for message %s in chat %s: %s\n", req.MessageID, req.ChatJID, errMsg)
 
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(DownloadMediaResponse{
